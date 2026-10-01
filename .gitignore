@@ -1,0 +1,29 @@
+# Binaries and libraries
+*.exe
+*.dll
+*.so
+*.dylib
+*.a
+*.zip
+*.tar.gz
+
+# Output directories
+output/
+build/
+dist/
+release/
+jniLibs/
+
+# Go workspace & vendor
+vendor/
+go.work
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,217 @@
+name: Sync Upstream and Build Core
+
+on:
+  schedule:
+    # 每 6 小时自动巡检一次上游 MetaCubeX/mihomo
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force_version:
+        description: '强制编译特定版本 (例如: v1.19.32)'
+        required: false
+        default: ''
+      force_build:
+        description: '无论版本是否相同均强制重新构建'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  check-upstream:
+    name: Check Upstream Version
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      tag: ${{ steps.check.outputs.tag }}
+    steps:
+      - name: Query Releases
+        id: check
+        run: |
+          UPSTREAM_TAG=$(curl -s -H "User-Agent: CI" https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r '.tag_name')
+          echo "Upstream latest tag: $UPSTREAM_TAG"
+
+          CURRENT_TAG=$(curl -s -H "User-Agent: CI" https://api.github.com/repos/${{ github.repository }}/releases/latest | jq -r '.tag_name // ""')
+          echo "Current repository latest tag: $CURRENT_TAG"
+
+          FORCE_VERSION="${{ inputs.force_version }}"
+          FORCE_BUILD="${{ inputs.force_build }}"
+
+          if [ -n "$FORCE_VERSION" ]; then
+            echo "Target version overridden by input: $FORCE_VERSION"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "tag=$FORCE_VERSION" >> $GITHUB_OUTPUT
+          elif [ "$FORCE_BUILD" = "true" ]; then
+            echo "Force build triggered: $UPSTREAM_TAG"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
+          elif [ "$UPSTREAM_TAG" != "null" ] && [ -n "$UPSTREAM_TAG" ] && [ "$UPSTREAM_TAG" != "$CURRENT_TAG" ]; then
+            echo "New upstream version detected: $UPSTREAM_TAG (current: $CURRENT_TAG)"
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            echo "tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
+          else
+            echo "Up-to-date with upstream ($CURRENT_TAG). Skipping build."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-android:
+    name: Build Android (${{ matrix.abi }})
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: arm64
+            abi: arm64-v8a
+            target: aarch64-linux-android24
+          - arch: arm
+            abi: armeabi-v7a
+            target: armv7a-linux-androideabi24
+          - arch: amd64
+            abi: x86_64
+            target: x86_64-linux-android24
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+
+      - name: Prepare Go Bridge Module
+        working-directory: bridge
+        run: |
+          go mod edit -require=github.com/metacubex/mihomo@${{ needs.check-upstream.outputs.tag }}
+          go mod tidy
+
+      - name: Compile libclash.so via Android NDK
+        working-directory: bridge
+        run: |
+          NDK_TOOLCHAIN="$ANDROID_NDK_LATEST_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC="$NDK_TOOLCHAIN/${{ matrix.target }}-clang"
+          export CXX="$NDK_TOOLCHAIN/${{ matrix.target }}-clang++"
+          export CGO_ENABLED=1
+          export GOOS=android
+          export GOARCH=${{ matrix.arch }}
+
+          mkdir -p ../output/${{ matrix.abi }}
+
+          go build -v -trimpath \
+            -ldflags="-s -w -buildid= -X github.com/metacubex/mihomo/constant.Version=${{ needs.check-upstream.outputs.tag }}" \
+            -tags with_gvisor \
+            -buildmode=c-shared \
+            -o ../output/${{ matrix.abi }}/libclash.so .
+
+      - name: Upload Android Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libclash-${{ matrix.abi }}
+          path: output/${{ matrix.abi }}/
+
+  build-windows:
+    name: Build Windows (${{ matrix.arch }})
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+          - arch: arm64
+
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Clone Upstream Mihomo
+        run: |
+          git clone --depth 1 --branch ${{ needs.check-upstream.outputs.tag }} https://github.com/MetaCubeX/mihomo.git upstream
+
+      - name: Compile Windows Executable
+        working-directory: upstream
+        run: |
+          export CGO_ENABLED=0
+          export GOOS=windows
+          export GOARCH=${{ matrix.arch }}
+
+          go build -v -trimpath \
+            -tags with_gvisor \
+            -ldflags="-s -w -buildid= -X github.com/metacubex/mihomo/constant.Version=${{ needs.check-upstream.outputs.tag }}" \
+            -o mihomo.exe .
+
+          mkdir -p ../output/windows
+          zip -9 -j ../output/windows/LuminClashCore-windows-${{ matrix.arch }}-${{ needs.check-upstream.outputs.tag }}.zip mihomo.exe
+
+      - name: Upload Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: output/windows/
+
+  publish-release:
+    name: Package and Publish Release
+    needs: [check-upstream, build-android, build-windows]
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Android Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+
+      - name: Package jniLibs and Checksums
+        run: |
+          mkdir -p jniLibs
+          mkdir -p dist
+
+          # 拷贝 Android 动态库架构目录
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            if [ -d "all-artifacts/libclash-$abi" ]; then
+              mkdir -p "jniLibs/$abi"
+              cp "all-artifacts/libclash-$abi/libclash.so" "jniLibs/$abi/"
+            fi
+          done
+
+          # 打包 jniLibs.zip (专供 Flutter 项目使用)
+          zip -r "dist/LuminClashCore-android-jniLibs-${{ needs.check-upstream.outputs.tag }}.zip" jniLibs
+
+          # 拷贝 Windows 压缩包
+          cp all-artifacts/windows-*/*.zip dist/ 2>/dev/null || true
+
+          # 计算 sha256 校验清单
+          cd dist
+          sha256sum * > sha256sums.txt
+          cd ..
+
+          ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-upstream.outputs.tag }}
+          name: LuminClashCore ${{ needs.check-upstream.outputs.tag }}
+          body: |
+            ### LuminClashCore 自动构建产物
+            - **对齐上游版本**：[MetaCubeX/mihomo ${{ needs.check-upstream.outputs.tag }}](https://github.com/MetaCubeX/mihomo/releases/tag/${{ needs.check-upstream.outputs.tag }})
+            - **构建特性**：包含 `with_gvisor` 标签，全量支持 TUN 模式
+
+            #### 产物说明
+            - **Android JNI 库**：`LuminClashCore-android-jniLibs-${{ needs.check-upstream.outputs.tag }}.zip`
+              *(解压后将 `arm64-v8a`、`armeabi-v7a`、`x86_64` 放置到 `android/app/src/main/jniLibs/` 即可)*
+            - **Windows 桌面端**：
+              - `LuminClashCore-windows-amd64-${{ needs.check-upstream.outputs.tag }}.zip`
+              - `LuminClashCore-windows-arm64-${{ needs.check-upstream.outputs.tag }}.zip`
+          files: |
+            dist/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
