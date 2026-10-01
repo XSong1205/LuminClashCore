@@ -9,6 +9,7 @@ import (
 	"unsafe"
 
 	"github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/hub"
 	"github.com/metacubex/mihomo/hub/executor"
 	"github.com/metacubex/mihomo/log"
 )
@@ -29,13 +30,11 @@ func StartCore(configPath *C.char) *C.char {
 		return C.CString(err.Error())
 	}
 
-	parsedCfg, err := executor.Parse(rawCfg)
-	if err != nil {
+	if err := hub.Parse(rawCfg); err != nil {
 		return C.CString(err.Error())
 	}
 
-	executor.ApplyConfig(parsedCfg, true)
-	log.Infoln("[LuminClashCore] Mihomo core started successfully")
+	log.Infoln("[LuminClashCore] Mihomo core started successfully with external controller")
 	return nil
 }
 
